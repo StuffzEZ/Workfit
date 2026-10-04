@@ -1,6 +1,6 @@
 [package]
 name = "workfit"
-version = "0.2.1"
+version = "0.2.2"
 description = "WorkFit multiscreen fitness kiosk"
 authors = ["WorkFit"]
 edition = "2021"
@@ -19,8 +19,12 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 argon2 = "0.5"
+btleplug = "0.13"
+futures-util = "0.3"
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["macros", "sync", "time"] }
+uuid = "1"

@@ -15,29 +15,38 @@ function VRApp() {
       return;
     }
     let mounted = true;
-    let unlisten: (() => void) | undefined;
-    invoke<RideMetrics | null>("get_latest_metrics")
-      .then((latest) => {
-        if (mounted) setMetrics(latest);
-      })
-      .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)));
-    listen<RideMetrics>("ride-metrics", (event) => setMetrics(event.payload))
-      .then((stop) => {
-        if (mounted) unlisten = stop;
-        else stop();
-      })
-      .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)));
-    listen("ride-ended", () => setMetrics(null))
-      .then((stop) => {
-        if (mounted) {
-          const previous = unlisten;
-          unlisten = () => { previous?.(); stop(); };
-        } else stop();
-      })
-      .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)));
+    let receivedLiveUpdate = false;
+    const unlisteners: (() => void)[] = [];
+    const subscribe = async () => {
+      const stopMetrics = await listen<RideMetrics>("ride-metrics", (event) => {
+        receivedLiveUpdate = true;
+        setMetrics(event.payload);
+      });
+      if (!mounted) {
+        stopMetrics();
+        return;
+      }
+      unlisteners.push(stopMetrics);
+
+      const stopEnd = await listen("ride-ended", () => {
+        receivedLiveUpdate = true;
+        setMetrics(null);
+      });
+      if (!mounted) {
+        stopEnd();
+        return;
+      }
+      unlisteners.push(stopEnd);
+
+      const latest = await invoke<RideMetrics | null>("get_latest_metrics");
+      if (mounted && !receivedLiveUpdate) setMetrics(latest);
+    };
+    subscribe().catch((reason: unknown) => {
+      if (mounted) setError(reason instanceof Error ? reason.message : String(reason));
+    });
     return () => {
       mounted = false;
-      unlisten?.();
+      unlisteners.forEach((stop) => stop());
     };
   }, []);
 

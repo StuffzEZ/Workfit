@@ -72,3 +72,20 @@ export type RaceSession = {
   mode: RaceMode;
   referenceRides: Ride[];
 };
+
+export type BluetoothHeartRateDevice = {
+  id: string;
+  name: string;
+  rssi: number | null;
+};
+
+export type BluetoothHeartRateSample = {
+  deviceId: string;
+  deviceName: string;
+  bpm: number;
+};
+
+export type BluetoothHeartRateConnection = {
+  id: string;
+  name: string;
+};

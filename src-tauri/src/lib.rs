@@ -1,3 +1,5 @@
+mod bluetooth;
+
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
@@ -15,6 +17,7 @@ struct KioskState {
     database: Mutex<Connection>,
     active_ride: Mutex<Option<i64>>,
     settings_unlocked: Mutex<bool>,
+    bluetooth_heart_rate: Mutex<Option<bluetooth::HeartRateSession>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -121,7 +124,9 @@ fn initialize_database(path: &Path) -> Result<Connection, String> {
 
 fn open_manager_database(path: &Path) -> Result<Connection, String> {
     if !path.is_file() {
-        return Err("Open WorkFit once to initialize local storage before opening WorkFit Manager.".into());
+        return Err(
+            "Open WorkFit once to initialize local storage before opening WorkFit Manager.".into(),
+        );
     }
     Connection::open(path).map_err(|error| format!("Could not open the WorkFit database: {error}"))
 }
@@ -411,6 +416,43 @@ fn authorize_window(label: &str, access: CommandAccess) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn scan_bluetooth_heart_rate_devices(
+    window: WebviewWindow,
+) -> Result<Vec<bluetooth::HeartRateDevice>, String> {
+    authorize_window(window.label(), CommandAccess::Control)?;
+    bluetooth::scan_heart_rate_devices().await
+}
+
+#[tauri::command]
+fn get_connected_bluetooth_heart_rate(
+    window: WebviewWindow,
+    state: State<'_, KioskState>,
+) -> Result<Option<bluetooth::ConnectedHeartRateDevice>, String> {
+    authorize_window(window.label(), CommandAccess::Control)?;
+    bluetooth::connected_heart_rate(&state.bluetooth_heart_rate)
+}
+
+#[tauri::command]
+async fn connect_bluetooth_heart_rate(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, KioskState>,
+    device_id: String,
+) -> Result<String, String> {
+    authorize_window(window.label(), CommandAccess::Control)?;
+    bluetooth::connect_heart_rate(app, &state.bluetooth_heart_rate, device_id).await
+}
+
+#[tauri::command]
+async fn disconnect_bluetooth_heart_rate(
+    window: WebviewWindow,
+    state: State<'_, KioskState>,
+) -> Result<(), String> {
+    authorize_window(window.label(), CommandAccess::Control)?;
+    bluetooth::disconnect_heart_rate(&state.bluetooth_heart_rate).await
+}
+
+#[tauri::command]
 fn get_idle_message(window: WebviewWindow, state: State<'_, KioskState>) -> Result<String, String> {
     authorize_window(window.label(), CommandAccess::DisplayRead)?;
     let connection = state
@@ -456,7 +498,10 @@ fn set_idle_message(
 }
 
 #[tauri::command]
-fn settings_pin_is_set(window: WebviewWindow, state: State<'_, KioskState>) -> Result<bool, String> {
+fn settings_pin_is_set(
+    window: WebviewWindow,
+    state: State<'_, KioskState>,
+) -> Result<bool, String> {
     authorize_window(window.label(), CommandAccess::Control)?;
     settings_pin_exists(&state)
 }
@@ -552,10 +597,7 @@ fn update_settings_pin(
             .map_err(|error| db_error("Could not save settings PIN", error))?;
     } else {
         connection
-            .execute(
-                "DELETE FROM settings WHERE key = 'settings_pin_hash'",
-                [],
-            )
+            .execute("DELETE FROM settings WHERE key = 'settings_pin_hash'", [])
             .map_err(|error| db_error("Could not remove settings PIN", error))?;
     }
     drop(connection);
@@ -934,7 +976,9 @@ fn start_ride(
 ) -> Result<i64, String> {
     authorize_window(window.label(), CommandAccess::Control)?;
     if matches!(source, RideSource::Device) {
-        return Err("No ANT+ or BLE device adapter is connected.".into());
+        return Err(
+            "Device-backed rides require a validated power-trainer adapter; a Bluetooth heart-rate sensor alone cannot provide cycling power.".into(),
+        );
     }
     let mut active_ride = state
         .active_ride
@@ -1279,10 +1323,10 @@ fn get_latest_metrics(
 }
 
 #[tauri::command]
-fn open_manager_console(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
+fn open_manager_console(window: WebviewWindow) -> Result<(), String> {
     authorize_window(window.label(), CommandAccess::ControlOrManager)?;
-    let current_exe = std::env::current_exe()
-        .map_err(|error| format!("Could not locate WorkFit: {error}"))?;
+    let current_exe =
+        std::env::current_exe().map_err(|error| format!("Could not locate WorkFit: {error}"))?;
     let manager_exe = std::env::var_os("WORKFIT_MANAGER_EXECUTABLE")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
@@ -1292,15 +1336,39 @@ fn open_manager_console(app: AppHandle, window: WebviewWindow) -> Result<(), Str
                 "workfit-manager"
             })
         });
-    Command::new(&manager_exe)
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| {
-            format!(
-                "Could not launch WorkFit Manager at {}: {error}. Launch its separate app shortcut if it is installed elsewhere.",
-                manager_exe.display()
-            )
-        })
+    if manager_exe.is_file() {
+        return Command::new(&manager_exe)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "Could not launch WorkFit Manager at {}: {error}.",
+                    manager_exe.display()
+                )
+            });
+    }
+
+    if cfg!(debug_assertions) {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        return Command::new("cargo")
+            .args(["run", "--manifest-path"])
+            .arg(&manifest)
+            .args(["--bin", "workfit-manager"])
+            .current_dir(manifest.parent().unwrap_or_else(|| Path::new(".")))
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "Could not start the WorkFit Manager development target with Cargo: {error}. \
+                     Build it with `npm run manager:build` or set WORKFIT_MANAGER_EXECUTABLE."
+                )
+            });
+    }
+
+    Err(format!(
+        "WorkFit Manager was not found at {}. Build and install the separate Manager app, or set WORKFIT_MANAGER_EXECUTABLE to its path.",
+        manager_exe.display()
+    ))
 }
 
 #[tauri::command]
@@ -1350,7 +1418,10 @@ fn open_app_window(
     page: &'static str,
     title: &'static str,
 ) -> tauri::Result<()> {
-    if app.get_webview_window(label).is_some() {
+    if let Some(window) = app.get_webview_window(label) {
+        window.unminimize()?;
+        window.show()?;
+        window.set_focus()?;
         return Ok(());
     }
     WebviewWindowBuilder::new(app, label, WebviewUrl::App(page.into()))
@@ -1361,6 +1432,13 @@ fn open_app_window(
 }
 
 fn open_secondary_display(app: &AppHandle) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window("display") {
+        window.unminimize()?;
+        window.show()?;
+        window.set_focus()?;
+        return Ok(());
+    }
+
     let monitors = app.available_monitors()?;
     let primary = app.primary_monitor()?;
     let secondary = monitors.iter().find(|monitor| {
@@ -1369,17 +1447,27 @@ fn open_secondary_display(app: &AppHandle) -> tauri::Result<()> {
             .is_none_or(|primary| !same_monitor(primary, monitor))
     });
 
-    let Some(monitor) = secondary else {
-        return Ok(());
+    let (position, width, height) = if let Some(monitor) = secondary {
+        let position = monitor.position().to_owned();
+        let size = monitor.size();
+        (position, size.width, size.height)
+    } else {
+        primary
+            .as_ref()
+            .map_or((PhysicalPosition::new(0, 0), 1280, 800), |monitor| {
+                let size = monitor.size();
+                (
+                    monitor.position().to_owned(),
+                    size.width.min(1280),
+                    size.height.min(800),
+                )
+            })
     };
-
-    let position = monitor.position();
-    let size = monitor.size();
     let window = WebviewWindowBuilder::new(app, "display", WebviewUrl::App("display.html".into()))
         .title("WorkFit Ride Display")
-        .inner_size(size.width as f64, size.height as f64)
+        .inner_size(width as f64, height as f64)
         .build()?;
-    window.set_position(PhysicalPosition::new(position.x, position.y))?;
+    window.set_position(position)?;
     Ok(())
 }
 
@@ -1394,6 +1482,7 @@ pub fn run() -> Result<(), tauri::Error> {
                 database: Mutex::new(database),
                 active_ride: Mutex::new(None),
                 settings_unlocked: Mutex::new(false),
+                bluetooth_heart_rate: Mutex::new(None),
             });
             Ok(())
         })
@@ -1418,6 +1507,10 @@ pub fn run() -> Result<(), tauri::Error> {
             exit_workfit,
             open_ride_display,
             close_ride_display,
+            scan_bluetooth_heart_rate_devices,
+            get_connected_bluetooth_heart_rate,
+            connect_bluetooth_heart_rate,
+            disconnect_bluetooth_heart_rate,
             settings_pin_is_set,
             unlock_settings,
             lock_settings,
@@ -1440,6 +1533,7 @@ pub fn run_manager() -> Result<(), tauri::Error> {
                 database: Mutex::new(database),
                 active_ride: Mutex::new(None),
                 settings_unlocked: Mutex::new(false),
+                bluetooth_heart_rate: Mutex::new(None),
             });
             if let Some(manager) = app.get_webview_window("manager") {
                 if let Some(primary) = app.primary_monitor()? {
