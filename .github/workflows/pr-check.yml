@@ -1,0 +1,208 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read   # needed to list this run's artifacts
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TAURI_DEPS: >-
+    libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev
+    libayatana-appindicator3-dev librsvg2-dev xvfb
+
+jobs:
+  # ───────────── Lint + unit tests ─────────────
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "clippy, rustfmt" }
+      - uses: swatinem/rust-cache@v2
+        with: { workspaces: src-tauri }
+      - run: sudo apt-get update && sudo apt-get install -y $TAURI_DEPS
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx eslint .
+      - run: npx prettier --check .
+      - run: npm test --if-present
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  # ───────────── Security ─────────────
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/dependency-review-action@v4
+        if: github.event_name == 'pull_request'
+      - run: npm audit --audit-level=high
+      - run: cargo install cargo-audit --locked && cargo audit --file src-tauri/Cargo.lock
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ───────────── Build (+ smoke test on Linux) ─────────────
+  build:
+    needs: lint-test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with: { workspaces: src-tauri }
+      - if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y $TAURI_DEPS
+      - run: npm ci
+      - run: npx tauri build   # full build, produces installers/bundles
+
+      - name: Smoke test (launch app under virtual display)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          BIN=$(ls src-tauri/target/release | grep -v '\.' | grep -vi build | head -1)
+          xvfb-run -a "./src-tauri/target/release/$BIN" > app.log 2>&1 &
+          PID=$!
+          sleep 15
+          if ! kill -0 $PID 2>/dev/null; then
+            echo "App exited early"; cat app.log; exit 1
+          fi
+          if grep -qiE "panicked|fatal" app.log; then cat app.log; exit 1; fi
+          kill $PID
+
+      - name: Upload build
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.os }}
+          path: |
+            src-tauri/target/release/bundle/**/*.exe
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/**/*.dmg
+            src-tauri/target/release/bundle/**/*.AppImage
+            src-tauri/target/release/bundle/**/*.deb
+            src-tauri/target/release/bundle/**/*.rpm
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ───────────── Rule-based + AI PR review ─────────────
+  pr-review:
+    needs: [lint-test, security, build]
+    # Run even if earlier jobs failed, so the comment reports it.
+    # Fork PRs get no secrets / read-only token, so only review same-repo PRs.
+    if: >-
+      ${{ !cancelled() && github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      AUTHOR: ${{ github.event.pull_request.user.login }}
+      ASSOC: ${{ github.event.pull_request.author_association }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+
+      - name: Rule-based findings
+        run: node scripts/lint-diff.mjs > findings.md
+
+      - name: PR details
+        run: |
+          gh pr view "$PR" --json title,additions,deletions,changedFiles,commits,headRefName,baseRefName > pr.json
+
+          TOTAL=$(gh pr list --author "$AUTHOR" --state all --limit 500 --json number --jq 'length')
+          MERGED=$(gh pr list --author "$AUTHOR" --state merged --limit 500 --json number --jq 'length')
+          JOINED=$(gh api "users/$AUTHOR" --jq '.created_at[:10]' 2>/dev/null || echo "unknown")
+          TYPES=$(git diff --name-only "$BASE_SHA"...HEAD | grep '\.' | sed 's/.*\.//' \
+                  | sort | uniq -c | sort -rn | head -5 | awk '{printf "`.%s` ×%s, ", $2, $1}' | sed 's/, $//')
+
+          icon() { case "$1" in success) echo "✅";; failure) echo "❌";; skipped) echo "⏭️";; cancelled) echo "🚫";; *) echo "❔";; esac; }
+
+          {
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **PR** | #$PR: $(jq -r .title pr.json) |"
+            echo "| **Author** | @$AUTHOR (\`$ASSOC\`, GitHub account since $JOINED) |"
+            echo "| **Previous PRs by author** | $((TOTAL-1)) submitted, $MERGED merged |"
+            echo "| **Branch** | \`$(jq -r .headRefName pr.json)\` → \`$(jq -r .baseRefName pr.json)\` |"
+            echo "| **Size** | $(jq -r .changedFiles pr.json) files, +$(jq -r .additions pr.json) / −$(jq -r .deletions pr.json), $(jq -r '.commits|length' pr.json) commits |"
+            echo "| **File types** | ${TYPES:-none} |"
+            echo ""
+            echo "### CI results"
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| Lint & tests | $(icon '${{ needs.lint-test.result }}') ${{ needs.lint-test.result }} |"
+            echo "| Security | $(icon '${{ needs.security.result }}') ${{ needs.security.result }} |"
+            echo "| Build + smoke test | $(icon '${{ needs.build.result }}') ${{ needs.build.result }} |"
+            echo ""
+            echo "### Downloads"
+            ARTS=$(gh api "repos/$GH_REPO/actions/runs/${{ github.run_id }}/artifacts" \
+              --jq '.artifacts[] | "- [\(.name)](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts/\(.id)) (\((.size_in_bytes/1048576*10|round)/10) MB)"')
+            if [ -n "$ARTS" ]; then
+              echo "$ARTS"
+              echo "_Requires GitHub login with repo access. Expires in 7 days._"
+            else
+              echo "_No build artifacts (build failed or was skipped)._"
+            fi
+            echo ""
+            echo "[Full run log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          } > details.md
+
+      - name: AI summary
+        continue-on-error: true   # a free-API outage must never block a PR
+        env:
+          POLLINATIONS_KEY: ${{ secrets.POLLINATIONS_KEY }}  # free key, optional
+        run: |
+          git diff $BASE_SHA...HEAD -- . ':!*.lock' ':!package-lock.json' | head -c 14000 > diff.txt
+          jq -n --rawfile diff diff.txt --rawfile f findings.md --arg title "$(jq -r .title pr.json)" '{
+            model: "openai-fast",
+            messages: [
+              {role:"system", content:"You review pull requests for a Tauri (Rust + web) fitness app. Be concise. Output: 1) a 3-sentence summary, 2) bugs or risks (logic errors, panics, data-privacy issues, bad UX states), 3) suggestions. Do not invent issues. If the diff looks fine, say so."},
+              {role:"user", content:("PR title: " + $title + "\n\nAutomated findings:\n" + $f + "\n\nDiff:\n" + $diff)}
+            ]}' > req.json
+
+          AUTH=()
+          [ -n "$POLLINATIONS_KEY" ] && AUTH=(-H "Authorization: Bearer $POLLINATIONS_KEY")
+          curl -sS --retry 3 --retry-delay 20 --max-time 120 \
+            https://gen.pollinations.ai/v1/chat/completions \
+            -H "Content-Type: application/json" "${AUTH[@]}" -d @req.json \
+            | jq -r '.choices[0].message.content // empty' > ai.md
+
+      - name: Post review comment
+        run: |
+          {
+            echo "## 🤖 PR Review"
+            echo
+            cat details.md
+            echo
+            echo "### Rule-based checks"
+            cat findings.md
+            echo
+            echo "### AI summary"
+            [ -s ai.md ] && cat ai.md || echo "_AI review unavailable (free API busy). Rule-based checks above still apply._"
+            echo
+            echo "<sub>Automated, so verify before acting.</sub>"
+          } > comment.md
+          gh pr comment "$PR" --body-file comment.md --edit-last --create-if-none
