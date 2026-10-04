@@ -4,7 +4,19 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { RouteStudio } from "./RouteStudio";
 import { BUILT_IN_CATALOG_VERSION, builtInRoutes } from "./routeCatalog";
-import type { KioskStatus, LeaderboardEntry, RaceSession, Ride, RideMetrics, Rider, Route, RoutePoint } from "../../types";
+import type {
+  BluetoothHeartRateDevice,
+  BluetoothHeartRateConnection,
+  BluetoothHeartRateSample,
+  KioskStatus,
+  LeaderboardEntry,
+  RaceSession,
+  Ride,
+  RideMetrics,
+  Rider,
+  Route,
+  RoutePoint,
+} from "../../types";
 import "../../styles.css";
 
 type WorkoutPhase = { name: string; durationMinutes: number; intensity: number };
@@ -1153,15 +1165,135 @@ function RideRow({ ride, detailed = false }: { ride: Ride; detailed?: boolean })
 }
 
 function DevicesPage({ status }: { status: KioskStatus | null }) {
+  const [devices, setDevices] = useState<BluetoothHeartRateDevice[]>([]);
+  const [connectedDevice, setConnectedDevice] = useState<BluetoothHeartRateConnection | null>(null);
+  const [heartRate, setHeartRate] = useState<BluetoothHeartRateSample | null>(null);
+  const [scanBusy, setScanBusy] = useState(false);
+  const [connectBusy, setConnectBusy] = useState(false);
+  const [deviceError, setDeviceError] = useState<string | null>(null);
+  const native = isTauri();
+
+  useEffect(() => {
+    if (!native) return;
+    let mounted = true;
+    let receivedConnectionEvent = false;
+    const unlisteners: (() => void)[] = [];
+    const subscribe = async () => {
+      const stopHeartRate = await listen<BluetoothHeartRateSample>("bluetooth-heart-rate", (event) => {
+        if (mounted) {
+          receivedConnectionEvent = true;
+          setHeartRate(event.payload);
+          setConnectedDevice({ id: event.payload.deviceId, name: event.payload.deviceName });
+        }
+      });
+      if (!mounted) {
+        stopHeartRate();
+        return;
+      }
+      unlisteners.push(stopHeartRate);
+      const stopDisconnected = await listen("bluetooth-disconnected", () => {
+        if (mounted) {
+          receivedConnectionEvent = true;
+          setConnectedDevice(null);
+          setHeartRate(null);
+          void invoke("disconnect_bluetooth_heart_rate").catch((reason: unknown) => {
+            if (mounted) setDeviceError(reason instanceof Error ? reason.message : String(reason));
+          });
+        }
+      });
+      if (!mounted) stopDisconnected();
+      else unlisteners.push(stopDisconnected);
+      const connection = await invoke<BluetoothHeartRateConnection | null>("get_connected_bluetooth_heart_rate");
+      if (mounted && !receivedConnectionEvent) setConnectedDevice(connection);
+    };
+    subscribe().catch((reason: unknown) => {
+      if (mounted) setDeviceError(reason instanceof Error ? reason.message : String(reason));
+    });
+    return () => {
+      mounted = false;
+      unlisteners.forEach((stop) => stop());
+    };
+  }, [native]);
+
+  const scanBluetooth = async () => {
+    setScanBusy(true);
+    setDeviceError(null);
+    try {
+      setDevices(await invoke<BluetoothHeartRateDevice[]>("scan_bluetooth_heart_rate_devices"));
+    } catch (reason) {
+      setDeviceError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setScanBusy(false);
+    }
+  };
+
+  const connectBluetooth = async (device: BluetoothHeartRateDevice) => {
+    setConnectBusy(true);
+    setDeviceError(null);
+    try {
+      const name = await invoke<string>("connect_bluetooth_heart_rate", { deviceId: device.id });
+      setConnectedDevice({ id: device.id, name });
+      setHeartRate(null);
+    } catch (reason) {
+      setDeviceError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setConnectBusy(false);
+    }
+  };
+
+  const disconnectBluetooth = async () => {
+    setConnectBusy(true);
+    setDeviceError(null);
+    try {
+      await invoke("disconnect_bluetooth_heart_rate");
+      setConnectedDevice(null);
+      setHeartRate(null);
+    } catch (reason) {
+      setDeviceError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setConnectBusy(false);
+    }
+  };
+
   return (
     <>
       <div className="page-heading"><div><div className="eyebrow">EQUIPMENT & SENSORS</div><h1>Your connected devices.</h1><p className="muted">See WorkFit monitor and fitness-equipment connection status.</p></div></div>
       <div className="device-card-grid">
-        <DeviceCard title="Smart trainer / bike" kind="Power · cadence · speed · resistance" status="Not connected" />
-        <DeviceCard title="Heart-rate monitor" kind="ANT+ · BLE heart-rate straps" status="Not connected" />
+        <article className="panel device-card">
+          <span className="device-icon">⌁</span>
+          <h2>Bluetooth LE heart-rate sensor</h2>
+          <p className="muted">Connects to Bluetooth-only sensors using the standard Heart Rate Service (180D). This path does not use ANT+.</p>
+          <div className="device-status"><span className="status-dot" />{connectedDevice ? `Connected · ${connectedDevice.name}` : "Not connected"}</div>
+          {heartRate && <div className="mt-3 text-2xl font-black heart">{heartRate.bpm} BPM</div>}
+          {!native && <p className="muted mt-3">Bluetooth connections require the native WorkFit desktop app.</p>}
+          {native && !connectedDevice && (
+            <>
+              <button className="secondary-action" disabled={scanBusy || connectBusy} onClick={() => void scanBluetooth()}>
+                {scanBusy ? "Scanning Bluetooth…" : "Scan for Bluetooth sensors"}
+              </button>
+              {devices.map((device) => (
+                <div className="mt-3 flex flex-wrap items-center justify-between gap-3" key={device.id}>
+                  <span>{device.name} · {device.rssi === null ? "Signal unavailable" : `${device.rssi} dBm`}</span>
+                  <button disabled={connectBusy} onClick={() => void connectBluetooth(device)}>
+                    {connectBusy ? "Connecting…" : "Connect"}
+                  </button>
+                </div>
+              ))}
+              {!scanBusy && devices.length === 0 && <p className="muted mt-3">Scan to find nearby sensors advertising the standard Bluetooth heart-rate service.</p>}
+            </>
+          )}
+          {native && connectedDevice && (
+            <button className="secondary-action" disabled={connectBusy} onClick={() => void disconnectBluetooth()}>
+              {connectBusy ? "Disconnecting…" : "Disconnect sensor"}
+            </button>
+          )}
+          {deviceError && <p className="mt-3 text-rose-300" role="alert">{deviceError}</p>}
+        </article>
+        <DeviceCard title="ANT+ FE-C trainer" kind="ANT+ USB dongle · power · cadence · speed · resistance control" status="Adapter not implemented or validated" />
+        <DeviceCard title="Bluetooth smart trainer" kind="Bluetooth FTMS power · cadence · speed · resistance control" status="FTMS trainer control not implemented" />
         <DeviceCard title="Ride display" kind="Second-screen presentation" status={status?.secondaryDisplayOpen ? "Connected" : "Single display"} />
       </div>
-      <div className="panel hardware-note"><div className="eyebrow">HARDWARE SUPPORT STATUS</div><p className="muted">Demo rides use clearly labeled simulated data. ANT+/FE-C and BLE adapters are not implemented or validated, including for the Wattbike Atom Pro 2021 Model B and Huawei Band 8. WorkFit will not claim sensor readings or resistance control without a tested adapter.</p></div>
+      <div className="panel hardware-note"><div className="eyebrow">HARDWARE SUPPORT STATUS</div><p className="muted">Bluetooth LE heart-rate sensors that advertise the standard 180D service can stream live BPM here. This does not yet feed ride recording or calibrate effort. ANT+/FE-C trainer control, Bluetooth FTMS trainer control, and device-backed rides remain unavailable and require separate adapters and hardware validation. The Wattbike Atom Pro 2021 Model B and Huawei Band 8 are not validated.</p></div>
     </>
   );
 }
