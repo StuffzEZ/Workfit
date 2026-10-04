@@ -1,5 +1,6 @@
 # Changelog
 
+- 0.2.2: Fix auxiliary windows, add standard BLE heart-rate monitoring, and improve live VR updates.
 - 0.2.1: Deliver the WorkFit desktop platform with route studio, workouts, games, and Manager.
 - 0.2.0: Add solo baseline rides and visual personal-best/past-rider bot races.
 - 0.1.9: Show a moving simulated route position during course rides and clarify supported desktop workflows.
