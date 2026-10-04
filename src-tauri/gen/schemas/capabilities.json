@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"WorkFit desktop window permissions","local":true,"windows":["control","display","manager","vr"],"permissions":["core:default","core:event:default"]}}
